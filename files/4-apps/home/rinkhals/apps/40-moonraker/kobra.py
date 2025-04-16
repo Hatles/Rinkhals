@@ -227,17 +227,6 @@ class Kobra:
         #         }}
         #     }}
         # }}"""
-        payload = """{{
-            "type": "print",
-            "action": "start",
-            "msgid": "{0}",
-            "timestamp": {1},
-            "data": {{
-                "taskid": "-1",
-                "filename": "{2}",
-                "filetype": 1
-            }}
-        }}""".format(uuid.uuid4(), round(time.time() * 1000), file)
 
         self.mqtt_print_report = False
         self.mqtt_print_error = None
