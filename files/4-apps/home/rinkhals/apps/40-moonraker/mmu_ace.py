@@ -38,10 +38,18 @@ from typing import (
     Coroutine
 )
 
-FlexCallback = Callable[..., Optional[Coroutine]]
+if TYPE_CHECKING:
+    FlexCallback = Callable[..., Optional[Coroutine]]
+    SubCallback = Callable[[Dict[str, Dict[str, Any]], float], Optional[Coroutine]]
+    _T = TypeVar("_T")
+else:
+    _T = Any
+    FlexCallback = Any
+    SubCallback = Any
 
 from ..utils import Sentinel
 from .http_client import HttpClient, HttpResponse
+from .klippy_apis import KlippyAPI
 
 @dataclass
 class ActiveFilamentStatus:
@@ -253,16 +261,43 @@ class MmuAce:
         self.tools = []
 
 class PrinterController:
-    async def send_event(self, name: str, args: dict | None = None) -> dict:
+    # async def send_event(self, name: str, args: dict | None = None) -> dict:
+    #     pass
+    
+    async def query_objects(self,
+                            objects: Mapping[str, Optional[List[str]]],
+                            default: Union[Sentinel, _T] = Sentinel.MISSING
+                            ) -> Union[_T, Dict[str, Any]]:
         pass
+    
+    async def subscribe_objects(
+            self,
+            objects: Mapping[str, Optional[List[str]]],
+            callback: Optional[SubCallback] = None,
+            default: Union[Sentinel, _T] = Sentinel.MISSING
+    ) -> Union[_T, Dict[str, Any]]:
+        pass
+        
 
 class KlippyPrinterController(PrinterController):
     def __init__(self, _server):
         self.server = _server
+        self.klippy_apis: KlippyAPI = self.server.lookup_component("klippy_apis")
+        
+    async def query_objects(self,
+                            objects: Mapping[str, Optional[List[str]]],
+                            default: Union[Sentinel, _T] = Sentinel.MISSING
+                            ) -> Union[_T, Dict[str, Any]]:
+        return await self.klippy_apis.query_objects(objects, default)
 
-    async def send_event(self, name: str, args: dict | None = None):
-        self.server.send_event("mmu_ace:status_update", asdict(self.get_status()))
-
+    async def subscribe_objects(
+            self,
+            objects: Mapping[str, Optional[List[str]]],
+            callback: Optional[SubCallback] = None,
+            default: Union[Sentinel, _T] = Sentinel.MISSING
+    ) -> Union[_T, Dict[str, Any]]:
+        return await self.klippy_apis.subscribe_objects(objects, callback, default)
+    
 # printer controller for test with remote printer
 class RemotePrinterController(PrinterController):
     def __init__(self, server, _host):
@@ -270,7 +305,7 @@ class RemotePrinterController(PrinterController):
         self.server = server
         self.http_client: HttpClient = self.server.lookup_component("http_client")
     
-    async def send_event(self, name: str, args: dict | None = None):
+    async def _send_event(self, name: str, args: dict | None = None):
         name = name.strip("/").replace(".", "/")
         
         response: HttpResponse
@@ -295,6 +330,20 @@ class RemotePrinterController(PrinterController):
         
         return result
 
+    async def query_objects(self,
+                            objects: Mapping[str, Optional[List[str]]],
+                            default: Union[Sentinel, _T] = Sentinel.MISSING
+                            ) -> Union[_T, Dict[str, Any]]:
+        raise NotImplementedError("Remote printer does not support queries")
+    
+    async def subscribe_objects(
+            self,
+            objects: Mapping[str, Optional[List[str]]],
+            callback: Optional[SubCallback] = None,
+            default: Union[Sentinel, _T] = Sentinel.MISSING
+    ) -> Union[_T, Dict[str, Any]]:
+        raise NotImplementedError("Remote printer does not support subscriptions")
+
 def rgb_to_rgba(rgb: List[int]) -> List[int]:
     return [rgb[0], rgb[1], rgb[2], 255]
 
@@ -316,7 +365,7 @@ class MmuAceController:
     def __init__(self, server: Server, host: str | None): 
         self.server = server
         self.eventloop = self.server.get_event_loop()
-        
+
         if host is None:
             self.printer = KlippyPrinterController(self.server)
         else:
@@ -335,7 +384,9 @@ class MmuAceController:
         for _ in range(retry):
             success = False
             try:
-                await self._load_mmu_ace_config()
+                # await self._load_mmu_ace_config()
+                klippy_apis: KlippyAPI = self.server.lookup_component("klippy_apis")
+                result = await klippy_apis.query_objects({ "filament_hub": None })
                 success = True
             except Exception as e:
                 logging.error(f"Error contacting moonraker: {e}")
@@ -352,38 +403,39 @@ class MmuAceController:
     
     async def _load_ace(self):
         await self._load_mmu_ace_config()
-        await self._load_mmu_ace()
+        await self._subscribe_mmu_ace_status_update()
 
         self._handle_status_update()
 
     async def _load_mmu_ace_config(self):
-        result = await self.printer.send_event("filament_hub.get_config")
+        result = await self.printer.query_objects({ "filament_hub": None })
         logging.warning(f"mmu ace config: {json.dumps(result)}")
-        
-    async def _load_mmu_ace(self):
-        result = await self.printer.send_event("objects.query", {"objects": { "filament_hub": None }})
-        logging.warning(f"mmu ace: {json.dumps(result)}")
+    
+    async def _subscribe_mmu_ace_status_update(self):
+        result = await self.printer.subscribe_objects({ "filament_hub": None }, self._handle_mmu_ace_status_update)
 
-        filament_hub = result["status"]["filament_hub"]
+        logging.warning(f"mmu ace status subscribe: {json.dumps(result)}")
         
+        filament_hub = result["filament_hub"]
+
         # set units
         self.ace.units = []
         self.ace.tools = []
         self.ace.ttg_map = []
-        
+
         for hub in filament_hub["filament_hubs"]:
             hub_id = hub["id"] + 1
             unit = MmuAceUnit(f"ACE {hub_id}")
             unit.gates = []
             for i, slot in enumerate(hub["slots"]):
                 index: int = slot["index"]
-                status: str = slot["status"] 
-                sku: str = slot["sku"] 
-                type: str = slot["type"] 
-                color: list[int] = slot["color"] 
+                status: str = slot["status"]
+                sku: str = slot["sku"]
+                type: str = slot["type"]
+                color: list[int] = slot["color"]
                 rfid: int = slot["rfid"]
                 source: int = slot["source"]
-                
+
                 gate = MmuAceGate()
                 gate.material = type
                 gate.filament_name = type
@@ -391,17 +443,62 @@ class MmuAceController:
                 gate.rfid = rfid
                 gate.source = source
                 gate.status = GATE_AVAILABLE if status == "ready" else GATE_EMPTY
-                
+
                 unit.gates.append(gate)
 
                 tool = MmuAceTool()
                 tool.name = f"T{i + 1}"
                 self.ace.tools.append(tool)
                 self.ace.ttg_map.append(i)
-                
+
             self.ace.units.append(unit)
-            
-                
+       
+    async def _handle_mmu_ace_status_update(self, status: Dict[str, Any], _: float):
+        logging.warning(f"mmu ace status update: {json.dumps(status)}")
+        
+        # if "filament_hub" in status:
+        #     filament_hub = status["filament_hub"]
+        #     for hub in filament_hub["filament_hubs"]:
+        #         hub_id = hub["id"] + 1
+        # 
+        # filament_hub = status["filament_hub"]
+        # 
+        # # set units
+        # self.ace.units = []
+        # self.ace.tools = []
+        # self.ace.ttg_map = []
+        # 
+        # for hub in filament_hub["filament_hubs"]:
+        #     hub_id = hub["id"] + 1
+        #     unit = MmuAceUnit(f"ACE {hub_id}")
+        #     unit.gates = []
+        #     for i, slot in enumerate(hub["slots"]):
+        #         index: int = slot["index"]
+        #         status: str = slot["status"] 
+        #         sku: str = slot["sku"] 
+        #         type: str = slot["type"] 
+        #         color: list[int] = slot["color"] 
+        #         rfid: int = slot["rfid"]
+        #         source: int = slot["source"]
+        #         
+        #         gate = MmuAceGate()
+        #         gate.material = type
+        #         gate.filament_name = type
+        #         gate.color = rgb_to_rgba(color)
+        #         gate.rfid = rfid
+        #         gate.source = source
+        #         gate.status = GATE_AVAILABLE if status == "ready" else GATE_EMPTY
+        #         
+        #         unit.gates.append(gate)
+        # 
+        #         tool = MmuAceTool()
+        #         tool.name = f"T{i + 1}"
+        #         self.ace.tools.append(tool)
+        #         self.ace.ttg_map.append(i)
+        #         
+        #     self.ace.units.append(unit)
+        # 
+        # self._handle_status_update()
     
     def get_status(self) -> MmuAceStatus:
 
@@ -698,11 +795,6 @@ class MmuAcePatcher:
                 destination[key] = value
 
         return destination
-    async def request_some_klippy_state(self):
-        klippy_apis = self.server.lookup_component('klippy_apis')
-        return await klippy_apis.query_objects({'print_stats': None})
-    def _notify_status_changed(self):
-        self.server.send_event("mmu_ace:status_update", self.get_status())
     
     async def _handle_mmu_request(self, web_request):
         return {
